@@ -2,6 +2,7 @@
 
 import datetime as dt
 import logging
+import time
 
 import requests
 
@@ -13,6 +14,12 @@ CONTACT_ENERGY_API_KEY = "z840P4lQCH9TqcjC9L2pP157DZcZJMcr5tVQCvyx"
 
 # Responses that mean the login token is no longer accepted.
 _AUTH_REJECTED = (requests.codes.unauthorized, requests.codes.forbidden)
+
+# Contact answers an expired login token with HTTP 502, not 401/403, so the
+# token cannot be detected as rejected. Sign in again once it is this old
+# (seconds), and once more after a 5xx unless it was issued just now.
+_TOKEN_MAX_AGE = 30 * 60
+_TOKEN_JUST_ISSUED = 60
 
 
 class ContactEnergyApi:
@@ -28,6 +35,8 @@ class ContactEnergyApi:
         self._url_base = "https://api.contact-digital-prod.net"
         self._email = email
         self._password = password
+        # monotonic time of the last successful login; None until then
+        self._token_time = None
 
     def login(self):
         """Login to the Contact Energy API."""
@@ -50,6 +59,7 @@ class ContactEnergyApi:
             except ValueError, KeyError, TypeError:
                 _LOGGER.error("Failed to login: unexpected response")
                 return False
+            self._token_time = time.monotonic()
             _LOGGER.debug("Logged in")
             self.refresh_session()
             return True
@@ -103,52 +113,99 @@ class ContactEnergyApi:
             except ValueError, KeyError, IndexError, TypeError:
                 _LOGGER.error("Customer has no usable account or contract")
                 return False
-            self._accountId = account_id
-            self._contractId = contract_id
-            self._gas_contract_id = ""
             ids = [c.get("contractId") for c in contracts if isinstance(c, dict)]
             ids = [i for i in ids if i]
+            electricity, gas = contract_id, ""
+            if len(ids) > 1 and contract_id == ids[0]:
+                gas = ids[1]
             # The API has no field distinguishing electricity from gas, and the
             # contracts are not in a fixed order: on some dual-fuel accounts
             # the gas contract comes first. Only the electricity contract
-            # serves hourly usage, so probe for it; if no contract answers
-            # (e.g. the API is down), fall back to the listed order.
-            electricity = self._find_hourly_contract(ids) if len(ids) > 1 else ""
-            if electricity:
-                self._contractId = electricity
-                others = [i for i in ids if i != electricity]
-                self._gas_contract_id = others[0] if others else ""
-            elif len(ids) > 1 and contract_id == ids[0]:
-                self._gas_contract_id = ids[1]
+            # serves hourly usage, so probe for it; unless exactly one
+            # contract does (e.g. the API is down), keep the listed order.
+            # The probe needs the account id, but the contracts are only
+            # assigned once it is done: both sensors share this object and
+            # must not see a half-finished pick.
+            self._accountId = account_id
+            hourly = self._find_hourly_contract(ids) if len(ids) > 1 else ""
+            if hourly:
+                electricity = hourly
+                others = [i for i in ids if i != hourly]
+                gas = others[0] if others else ""
+            self._contractId, self._gas_contract_id = electricity, gas
             _LOGGER.debug("Retrieved accounts")
             return True
         _LOGGER.error("Failed to fetch customer accounts: HTTP %s", result.status_code)
         return False
 
     def _find_hourly_contract(self, contract_ids):
-        """Return the first contract that serves hourly usage, or "" if none.
+        """Return the one contract that serves hourly usage, or "" if unsure.
 
         Probes a day far enough back to have been published (Contact Energy
-        runs about two days late). Gas contracts answer HTTP 502 here.
+        runs about two days late). Gas contracts answer HTTP 502 here. A
+        contract only counts if it returns usage data, and only when exactly
+        one contract does: a one-off failure on the electricity contract must
+        not swap the two.
         """
         day = (dt.date.today() - dt.timedelta(days=3)).isoformat()
-        headers = {
-            "x-api-key": CONTACT_ENERGY_API_KEY,
-            "authorization": self._api_token,
-        }
+        serving = []
         for contract_id in contract_ids:
-            url = (
-                f"{self._url_base}/usage/v2/{contract_id}"
-                f"?ba={self._accountId}&interval=hourly&from={day}&to={day}"
-            )
             try:
-                response = requests.post(url, headers=headers, timeout=(10, 30))
+                response = self._post_usage(contract_id, "hourly", day, day)
             except requests.RequestException as err:
                 _LOGGER.debug("Contract probe failed: %s", type(err).__name__)
                 continue
-            if response.status_code == requests.codes.ok:
-                return contract_id
+            if response.status_code != requests.codes.ok:
+                continue
+            try:
+                data = response.json()
+            except ValueError:
+                continue
+            if isinstance(data, list) and data:
+                serving.append(contract_id)
+        if len(serving) == 1:
+            return serving[0]
+        if len(serving) > 1:
+            _LOGGER.debug("Several contracts serve hourly usage; keeping listed order")
         return ""
+
+    def _token_age(self):
+        """Seconds since the last login, or None if the token's age is unknown."""
+        if self._token_time is None:
+            return None
+        return time.monotonic() - self._token_time
+
+    def _post_usage(self, contract_id, interval, date_from, date_to):
+        """POST a usage request, signing in again if the token may have expired.
+
+        Raises requests.RequestException like requests.post.
+        """
+        url = (
+            f"{self._url_base}/usage/v2/{contract_id}"
+            f"?ba={self._accountId}&interval={interval}&from={date_from}&to={date_to}"
+        )
+        age = self._token_age()
+        if self._api_token and age is not None and age > _TOKEN_MAX_AGE:
+            _LOGGER.debug("Login token is %d s old; signing in again", age)
+            self.login()
+        response = requests.post(url, headers=self._usage_headers(), timeout=(10, 30))
+        age = self._token_age()
+        if response.status_code >= 500 and age is not None and age > _TOKEN_JUST_ISSUED:
+            _LOGGER.info(
+                "Usage request returned HTTP %s; signing in again and retrying",
+                response.status_code,
+            )
+            if self.login():
+                response = requests.post(
+                    url, headers=self._usage_headers(), timeout=(10, 30)
+                )
+        return response
+
+    def _usage_headers(self):
+        return {
+            "x-api-key": CONTACT_ENERGY_API_KEY,
+            "authorization": self._api_token,
+        }
 
     def get_usage(self, year, month, day):
         """Fetch hourly usage data for a single day.
@@ -159,17 +216,9 @@ class ContactEnergyApi:
         if not self._contractId or not self._accountId:
             _LOGGER.error("No account or contract known yet; cannot fetch usage")
             return False
-        headers = {
-            "x-api-key": CONTACT_ENERGY_API_KEY,
-            "authorization": self._api_token,
-        }
         date = f"{year}-{str(month).zfill(2)}-{str(day).zfill(2)}"
-        url = (
-            f"{self._url_base}/usage/v2/{self._contractId}"
-            f"?ba={self._accountId}&interval=hourly&from={date}&to={date}"
-        )
         try:
-            response = requests.post(url, headers=headers, timeout=(10, 30))
+            response = self._post_usage(self._contractId, "hourly", date, date)
         except requests.RequestException as err:
             _LOGGER.error(
                 "Failed to fetch usage for %s/%s/%s: %s",
@@ -215,16 +264,10 @@ class ContactEnergyApi:
         """
         if not self._gas_contract_id or not self._accountId:
             return False
-        headers = {
-            "x-api-key": CONTACT_ENERGY_API_KEY,
-            "authorization": self._api_token,
-        }
-        url = (
-            f"{self._url_base}/usage/v2/{self._gas_contract_id}"
-            f"?ba={self._accountId}&interval=monthly&from={date_from}&to={date_to}"
-        )
         try:
-            response = requests.post(url, headers=headers, timeout=(10, 30))
+            response = self._post_usage(
+                self._gas_contract_id, "monthly", date_from, date_to
+            )
         except requests.RequestException as err:
             _LOGGER.error(
                 "Failed to fetch gas usage for %s to %s: %s",

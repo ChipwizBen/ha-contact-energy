@@ -109,6 +109,7 @@ Contact Energy never returns a gas dollar cost, so the integration works it out 
 ## How it works
 
 - Every **6 hours** the integration signs in to Contact Energy and re-reads the **last 7 days**, since the newest days are still being finalised.
+- Contact's sign-in expires after a few hours and an expired one gets `HTTP 502` rather than a "not authorised" error, so the integration signs in again whenever its sign-in is over 30 minutes old, and once more (with a retry) after any 5xx error.
 - The numbers go into Home Assistant's **long-term statistics**, not into a sensor. That's why the **Contact Energy Usage** and **Gas Usage** entities are hidden and always read `0`: they only exist to trigger the update. To see your data, use the [Energy Dashboard](#energy-dashboard) or **Developer tools → Statistics**.
 - Each refresh carries on from the totals already stored, so re-reading recent days never makes earlier history jump or go negative.
 
@@ -132,6 +133,7 @@ Older versions also exposed a "Contact Energy Usage" sensor with a `total` state
 | The **Contact Energy Usage** entity shows `0` or is hidden | Expected. The data is in statistics, not in the entity. See [How it works](#how-it-works) |
 | No data for today or yesterday | Contact Energy publishes about 2 days late |
 | "Invalid email address or password" | Check you can sign in at myaccount.contact.co.nz |
+| Log shows "Failed to fetch usage …: HTTP 502" every refresh and no new data | Versions up to 2.1.2 never signed in again after Contact expired the sign-in (about 6 hours after starting). Update, or reload the integration as a stopgap |
 | Gas shows no data | Gas tracking is off by default; turn it on in **Configure**. Gas is detected as the account's contract that is not electricity (see below) |
 | Older days look too low after upgrading | Raise **Days of usage history** in **Configure** to backfill them (see [Upgrading](#upgrading-from-201-or-earlier)) |
 

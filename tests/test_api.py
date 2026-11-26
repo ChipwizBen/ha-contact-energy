@@ -436,6 +436,11 @@ class TestGasRequestsAreHardened:
         assert "interval=monthly" in url
 
 
+def _serving():
+    """A probe response from a contract that serves hourly usage."""
+    return MagicMock(status_code=200, json=lambda: [{"value": "1.5"}])
+
+
 class TestGasContractDetection:
     def _accounts(self, contracts):
         return MagicMock(
@@ -470,12 +475,61 @@ class TestGasContractDetection:
     @patch("custom_components.contact_energy.api.requests.get")
     def test_gas_listed_first_is_detected_by_probe(self, mock_get, mock_post, api):
         mock_get.return_value = self._accounts([{"contractId": 20}, {"contractId": 10}])
-        mock_post.side_effect = lambda url, **kw: MagicMock(
-            status_code=200 if "/usage/v2/10?" in url else 502
+        mock_post.side_effect = lambda url, **kw: (
+            _serving() if "/usage/v2/10?" in url else MagicMock(status_code=502)
         )
         assert api.get_accounts() is True
         assert (api._contractId, api._gas_contract_id) == (10, 20)
         assert "interval=hourly" in mock_post.call_args_list[0][0][0]
+
+    @patch("custom_components.contact_energy.api.requests.post")
+    @patch("custom_components.contact_energy.api.requests.get")
+    def test_probe_all_fail_keeps_listed_order(self, mock_get, mock_post, api):
+        mock_get.return_value = self._accounts([{"contractId": 20}, {"contractId": 10}])
+        mock_post.return_value = MagicMock(status_code=502)
+        assert api.get_accounts() is True
+        assert (api._contractId, api._gas_contract_id) == (20, 10)
+        assert mock_post.call_count == 2
+
+    @patch("custom_components.contact_energy.api.requests.post")
+    @patch("custom_components.contact_energy.api.requests.get")
+    def test_empty_200_does_not_count_as_electricity(self, mock_get, mock_post, api):
+        """Electricity probe fails once, gas answers 200 with no data: no swap."""
+        mock_get.return_value = self._accounts([{"contractId": 10}, {"contractId": 20}])
+        mock_post.side_effect = lambda url, **kw: (
+            MagicMock(status_code=200, json=lambda: [])
+            if "/usage/v2/20?" in url
+            else MagicMock(status_code=502)
+        )
+        assert api.get_accounts() is True
+        assert (api._contractId, api._gas_contract_id) == (10, 20)
+
+    @patch("custom_components.contact_energy.api.requests.post")
+    @patch("custom_components.contact_energy.api.requests.get")
+    def test_several_serving_contracts_keep_listed_order(
+        self, mock_get, mock_post, api
+    ):
+        mock_get.return_value = self._accounts([{"contractId": 20}, {"contractId": 10}])
+        mock_post.side_effect = lambda url, **kw: _serving()
+        assert api.get_accounts() is True
+        assert (api._contractId, api._gas_contract_id) == (20, 10)
+
+    @patch("custom_components.contact_energy.api.requests.post")
+    @patch("custom_components.contact_energy.api.requests.get")
+    def test_contracts_are_not_changed_during_the_probe(self, mock_get, mock_post, api):
+        """Both sensors share the API object; they must never see a half pick."""
+        api._contractId, api._gas_contract_id = 10, 20
+        seen = []
+
+        def post(url, **kw):
+            seen.append((api._contractId, api._gas_contract_id))
+            return _serving() if "/usage/v2/10?" in url else MagicMock(status_code=502)
+
+        mock_get.return_value = self._accounts([{"contractId": 20}, {"contractId": 10}])
+        mock_post.side_effect = post
+        assert api.get_accounts() is True
+        assert seen == [(10, 20), (10, 20)]
+        assert (api._contractId, api._gas_contract_id) == (10, 20)
 
     @patch("custom_components.contact_energy.api.requests.post")
     @patch("custom_components.contact_energy.api.requests.get")
@@ -495,3 +549,103 @@ class TestGasContractDetection:
         mock_get.return_value = self._accounts([{"contractId": 10}])
         assert api.get_accounts() is True
         mock_post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Expired login token: Contact answers it with HTTP 502, not 401/403
+# ---------------------------------------------------------------------------
+
+
+def _aged_api(age):
+    """An API whose token was issued `age` seconds ago."""
+    import time
+
+    a = ContactEnergyApi("u@example.com", "p")
+    a._contractId = 10
+    a._gas_contract_id = 20
+    a._accountId = 1
+    a._api_token = "old"
+    a._token_time = time.monotonic() - age
+    return a
+
+
+def _fake_login(api):
+    """Patch login() to issue a new token, like a real sign-in."""
+    import time
+
+    def login():
+        api._api_token = "new"
+        api._token_time = time.monotonic()
+        return True
+
+    return patch.object(api, "login", side_effect=login)
+
+
+def _status_by_token(old_status=502, new_status=200):
+    def post(url, headers=None, **kw):
+        if headers["authorization"] == "new":
+            return MagicMock(status_code=new_status, json=lambda: [{"value": "1"}])
+        return MagicMock(status_code=old_status)
+
+    return post
+
+
+class TestExpiredToken:
+    @patch("custom_components.contact_energy.api.requests.post")
+    def test_login_records_token_time(self, mock_post, api):
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"token": "t"})
+        with patch.object(api, "refresh_session"):
+            assert api.login() is True
+        assert api._token_time is not None
+
+    @patch("custom_components.contact_energy.api.requests.post")
+    def test_502_with_old_token_signs_in_again_and_retries(self, mock_post):
+        api = _aged_api(600)
+        mock_post.side_effect = _status_by_token()
+        with _fake_login(api) as login:
+            assert api.get_usage(2026, 11, 20) == [{"value": "1"}]
+        login.assert_called_once()
+        assert mock_post.call_count == 2
+
+    @patch("custom_components.contact_energy.api.requests.post")
+    def test_gas_502_with_old_token_signs_in_again_and_retries(self, mock_post):
+        api = _aged_api(600)
+        mock_post.side_effect = _status_by_token()
+        with _fake_login(api) as login:
+            assert api.get_gas_usage("2025-01-01", "2025-02-01") == [{"value": "1"}]
+        login.assert_called_once()
+
+    @patch("custom_components.contact_energy.api.requests.post")
+    def test_502_after_fresh_login_is_not_retried(self, mock_post):
+        api = _aged_api(5)
+        mock_post.return_value = MagicMock(status_code=502)
+        with _fake_login(api) as login:
+            assert api.get_usage(2026, 11, 20) is False
+        login.assert_not_called()
+        assert mock_post.call_count == 1
+
+    @patch("custom_components.contact_energy.api.requests.post")
+    def test_persistent_502_signs_in_only_once(self, mock_post):
+        api = _aged_api(600)
+        mock_post.return_value = MagicMock(status_code=502)
+        with _fake_login(api) as login:
+            assert api.get_usage(2026, 11, 20) is False
+        login.assert_called_once()
+        assert mock_post.call_count == 2
+
+    @patch("custom_components.contact_energy.api.requests.post")
+    def test_old_token_is_renewed_before_the_request(self, mock_post):
+        api = _aged_api(31 * 60)
+        mock_post.side_effect = _status_by_token(old_status=200)
+        with _fake_login(api) as login:
+            api.get_usage(2026, 11, 20)
+        login.assert_called_once()
+        assert mock_post.call_count == 1
+        assert mock_post.call_args[1]["headers"]["authorization"] == "new"
+
+    @patch("custom_components.contact_energy.api.requests.post")
+    def test_failed_renewal_still_tries_the_request(self, mock_post):
+        api = _aged_api(31 * 60)
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: [])
+        with patch.object(api, "login", return_value=False):
+            assert api.get_usage(2026, 11, 20) == []
