@@ -139,7 +139,7 @@ Older versions also exposed a "Contact Energy Usage" sensor with a `total` state
 
 ### Known limitations
 
-- **Gas contract detection is a heuristic.** The API gives no field for a contract's fuel type, and on some dual-fuel accounts gas is listed first. The integration takes the contract that serves hourly usage as electricity and the other as gas, falling back to the listed order if neither answers. If yours is something else (for example a second meter), gas tracking may create a sensor with no data, or fail quietly. Please open an issue if you hit this.
+- **Gas contract detection is a heuristic.** The API gives no field for a contract's fuel type, and on some dual-fuel accounts gas is listed first. The integration takes the contract that returns hourly usage data as electricity and the other as gas. If no contract, or more than one, returns data, it keeps the listed order. If yours is something else (for example a second meter), gas tracking may create a sensor with no data, or fail quietly. Please open an issue if you hit this.
 - **One account only:** the first account on your login.
 - **Gas is monthly.** The Energy Dashboard shows each month's gas as one spike at the start of the month, not spread over the days.
 
